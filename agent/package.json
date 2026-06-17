@@ -1,0 +1,13 @@
+{
+  "name": "log-grid-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lightweight server agent for LogGrid P2P mesh",
+  "main": "index.js",
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "optionalDependencies": {
+    "wrtc": "^0.4.7"
+  }
+}

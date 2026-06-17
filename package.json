@@ -1,0 +1,16 @@
+{
+  "name": "log-grid",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Decentralized P2P log viewing tool via WebRTC mesh",
+  "workspaces": [
+    "signaling-server",
+    "agent"
+  ],
+  "scripts": {
+    "signal": "node signaling-server/index.js",
+    "agent": "node agent/index.js",
+    "agent:sim": "node agent/index.js --simulate",
+    "frontend": "npx http-server frontend -p 8080 -c-1"
+  }
+}

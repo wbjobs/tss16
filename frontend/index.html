@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LogGrid — P2P 去中心化日志网格</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="header">
+    <div class="header-left">
+      <h1 class="logo">⬡ LogGrid</h1>
+      <span class="status-badge" id="connectionStatus">未连接</span>
+    </div>
+    <div class="header-right">
+      <label class="config-label">
+        信令服务器
+        <input type="text" id="signalUrl" value="ws://localhost:9000" class="config-input" />
+      </label>
+      <button id="connectBtn" class="btn btn-primary">连接网格</button>
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <div class="toolbar-left">
+      <div class="filter-group">
+        <label>日志级别</label>
+        <select id="levelFilter" class="filter-select">
+          <option value="">全部</option>
+          <option value="DEBUG">DEBUG</option>
+          <option value="INFO">INFO</option>
+          <option value="WARN">WARN</option>
+          <option value="ERROR">ERROR</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <label>关键词</label>
+        <input type="text" id="keywordFilter" class="filter-input" placeholder="搜索关键词..." />
+      </div>
+      <div class="filter-group">
+        <label>来源</label>
+        <select id="sourceFilter" class="filter-select">
+          <option value="">全部</option>
+        </select>
+      </div>
+      <button id="queryBtn" class="btn btn-accent" disabled>查询日志</button>
+      <button id="stopBtn" class="btn btn-danger" disabled>停止</button>
+    </div>
+    <div class="toolbar-right">
+      <label class="toggle-label">
+        <input type="checkbox" id="autoScroll" checked />
+        自动滚动
+      </label>
+      <span class="log-count" id="logCount">0 条日志</span>
+    </div>
+  </div>
+
+  <div class="main-content">
+    <div class="sidebar">
+      <h3 class="sidebar-title">网格节点</h3>
+      <div id="nodeList" class="node-list">
+        <div class="node-empty">暂无节点</div>
+      </div>
+      <h3 class="sidebar-title">统计</h3>
+      <div id="stats" class="stats">
+        <div class="stat-row"><span>接收日志</span><span id="statTotal">0</span></div>
+        <div class="stat-row"><span>ERROR</span><span id="statError" class="level-error">0</span></div>
+        <div class="stat-row"><span>WARN</span><span id="statWarn" class="level-warn">0</span></div>
+        <div class="stat-row"><span>INFO</span><span id="statInfo" class="level-info">0</span></div>
+        <div class="stat-row"><span>DEBUG</span><span id="statDebug" class="level-debug">0</span></div>
+      </div>
+    </div>
+
+    <div class="log-viewer" id="logViewer">
+      <div class="log-header">
+        <span class="col-time">时间</span>
+        <span class="col-level">级别</span>
+        <span class="col-source">来源</span>
+        <span class="col-node">节点</span>
+        <span class="col-message">消息</span>
+      </div>
+      <div class="log-viewport" id="logViewport">
+        <div class="log-content" id="logContent"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="log-detail" id="logDetail" style="display:none;">
+    <div class="log-detail-header">
+      <span>日志详情</span>
+      <button id="closeDetailBtn" class="btn-close">&times;</button>
+    </div>
+    <pre id="logDetailContent"></pre>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
