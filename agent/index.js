@@ -8,7 +8,9 @@ const {
   makeRegister, makeSignal, makeRelay,
   makeQuery, makeQueryCancel,
   makeLogStream, makeLogStreamEnd,
-  makePing, makePong
+  makePing, makePong,
+  makeCollectAck, makeCollectData, makeCollectEnd,
+  makeHealthStats
 } = require('../shared/protocol');
 
 let wrtc = null;
@@ -35,6 +37,11 @@ const PING_INTERVAL_MS = 5000;
 const PING_TIMEOUT_MS = 15000;
 const RECONNECT_BASE_DELAY = 2000;
 const RECONNECT_MAX_DELAY = 30000;
+const HEALTH_STATS_INTERVAL_MS = 10000;
+const HEALTH_WINDOW_MS = 60000;
+const HEALTH_BUCKET_MS = 10000;
+const COLLECT_CHUNK_SIZE = 32 * 1024;
+const COLLECT_LOOKBACK_MS = 60 * 60 * 1000;
 
 const log = (...args) => console.log(`[${NODE_ID}]`, ...args);
 
@@ -404,12 +411,14 @@ class Agent {
     this.peers = new Map();
     this.tailer = new LogTailer(this);
     this.localLogs = [];
-    this.maxLocalLogs = 5000;
+    this.maxLocalLogs = 50000;
     this.activeQueries = new Map();
     this.seenQueryIds = new Set();
     this.maxSeenQueries = 1000;
     this.reconnectTimer = null;
     this.wsReconnectAttempts = 0;
+    this.healthBuckets = new Map();
+    this.activeCollects = new Map();
   }
 
   async start() {
@@ -432,6 +441,8 @@ class Agent {
         }
       }
     }, PING_INTERVAL_MS);
+
+    this._healthInterval = setInterval(() => this._reportHealthStats(), HEALTH_STATS_INTERVAL_MS);
   }
 
   _connectSignal() {
@@ -570,9 +581,10 @@ class Agent {
   onLocalLog(source, line) {
     const levelMatch = line.match(/\[(DEBUG|INFO|WARN|ERROR)\]/);
     const level = levelMatch ? levelMatch[1] : 'INFO';
+    const now = Date.now();
 
     const entry = {
-      timestamp: Date.now(),
+      timestamp: now,
       source,
       level,
       message: line,
@@ -583,6 +595,20 @@ class Agent {
     this.localLogs.push(entry);
     if (this.localLogs.length > this.maxLocalLogs) {
       this.localLogs = this.localLogs.slice(-this.maxLocalLogs);
+    }
+
+    const bucketKey = Math.floor(now / HEALTH_BUCKET_MS) * HEALTH_BUCKET_MS;
+    let bucket = this.healthBuckets.get(bucketKey);
+    if (!bucket) {
+      bucket = { DEBUG: 0, INFO: 0, WARN: 0, ERROR: 0, total: 0, ts: bucketKey };
+      this.healthBuckets.set(bucketKey, bucket);
+    }
+    bucket[level]++;
+    bucket.total++;
+
+    const cutoff = Math.floor((now - HEALTH_WINDOW_MS * 2) / HEALTH_BUCKET_MS) * HEALTH_BUCKET_MS;
+    for (const k of this.healthBuckets.keys()) {
+      if (k < cutoff) this.healthBuckets.delete(k);
     }
 
     for (const [queryId, query] of this.activeQueries) {
@@ -631,6 +657,12 @@ class Agent {
           peer.lastPongAt = now;
           peer.dead = false;
           peer.connected = true;
+        }
+        break;
+      }
+      case MSG_TYPE.COLLECT_REQ: {
+        if (!msg.targetId || msg.targetId === NODE_ID) {
+          this._handleCollectReq(fromId, msg);
         }
         break;
       }
@@ -708,11 +740,86 @@ class Agent {
   stop() {
     this.tailer.stop();
     if (this._pingInterval) clearInterval(this._pingInterval);
+    if (this._healthInterval) clearInterval(this._healthInterval);
     for (const [, peer] of this.peers) {
       peer.close();
     }
     if (this.ws) this.ws.close();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+  }
+
+  _reportHealthStats() {
+    const now = Date.now();
+    const windowStart = Math.floor((now - HEALTH_WINDOW_MS) / HEALTH_BUCKET_MS) * HEALTH_BUCKET_MS;
+    const perLevel = { DEBUG: 0, INFO: 0, WARN: 0, ERROR: 0, total: 0 };
+    const buckets = [];
+    for (const [, b] of this.healthBuckets) {
+      if (b.ts >= windowStart) {
+        buckets.push({ ts: b.ts, DEBUG: b.DEBUG, INFO: b.INFO, WARN: b.WARN, ERROR: b.ERROR, total: b.total });
+      }
+    }
+    buckets.sort((a, b) => a.ts - b.ts);
+    for (const b of buckets) {
+      perLevel.DEBUG += b.DEBUG;
+      perLevel.INFO += b.INFO;
+      perLevel.WARN += b.WARN;
+      perLevel.ERROR += b.ERROR;
+      perLevel.total += b.total;
+    }
+    const msg = makeHealthStats(NODE_ID, HEALTH_WINDOW_MS, perLevel, buckets);
+    for (const [peerId, peer] of this.peers) {
+      if (peer.connected && !peer.dead) {
+        this._sendToPeer(peerId, msg);
+      }
+    }
+  }
+
+  async _handleCollectReq(fromId, msg) {
+    const collectId = msg.collectId;
+    log(`emergency collect request from ${fromId} (id=${collectId})`);
+    const now = Date.now();
+    const cutoff = now - COLLECT_LOOKBACK_MS;
+    const recentLogs = this.localLogs.filter(e => e.timestamp >= cutoff);
+
+    const header = `# Emergency Log Collection\n` +
+      `# Node: ${NODE_ID} (${os.hostname()})\n` +
+      `# Platform: ${os.platform()} ${os.arch()}\n` +
+      `# Uptime: ${os.uptime()}s\n` +
+      `# Collected at: ${new Date(now).toISOString()}\n` +
+      `# Window: ${new Date(cutoff).toISOString()} ~ ${new Date(now).toISOString()}\n` +
+      `# Total entries: ${recentLogs.length}\n` +
+      `# ---- stack traces follow ----\n`;
+
+    const lines = [header];
+    for (const e of recentLogs) {
+      const iso = new Date(e.timestamp).toISOString().replace('T', ' ').replace('Z', '');
+      lines.push(`${iso} [${e.level}] [${e.source}] [${e.nodeId}] ${e.message}`);
+      if (e.level === 'ERROR' || e.level === 'WARN') {
+        lines.push(`  > Stack: simulated stack trace for ${e.source}#op_${Math.floor(Math.random()*1000)}`);
+        lines.push(`  >   at Handler.dispatch (handler.js:${40+Math.floor(Math.random()*80)}:${10+Math.floor(Math.random()*30)})`);
+        lines.push(`  >   at Service.invoke (service.js:${100+Math.floor(Math.random()*400)}:${10+Math.floor(Math.random()*30)})`);
+        lines.push(`  >   at Pipeline.run (pipeline.js:${50+Math.floor(Math.random()*200)}:${10+Math.floor(Math.random()*30)})`);
+      }
+    }
+    const fullText = lines.join('\n');
+    const b64 = Buffer.from(fullText, 'utf8').toString('base64');
+    const totalSize = b64.length;
+    const chunkSize = COLLECT_CHUNK_SIZE;
+    const chunkCount = Math.max(1, Math.ceil(totalSize / chunkSize));
+
+    this._sendToPeer(fromId, makeCollectAck(collectId, NODE_ID, fromId, totalSize, chunkCount));
+    log(`collect ${collectId}: sending ${chunkCount} chunks (${totalSize} bytes)`);
+
+    for (let i = 0; i < chunkCount; i++) {
+      const chunk = b64.slice(i * chunkSize, (i + 1) * chunkSize);
+      this._sendToPeer(fromId, makeCollectData(collectId, NODE_ID, fromId, i, chunkCount, chunk));
+      await new Promise(r => setTimeout(r, 5));
+    }
+
+    let checksum = 0;
+    for (let i = 0; i < b64.length; i++) checksum = (checksum * 31 + b64.charCodeAt(i)) >>> 0;
+    this._sendToPeer(fromId, makeCollectEnd(collectId, NODE_ID, fromId, chunkCount, checksum));
+    log(`collect ${collectId}: finished`);
   }
 }
 

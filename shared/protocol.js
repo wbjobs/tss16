@@ -10,7 +10,12 @@ const MSG_TYPE = {
   LOG_STREAM: 'log-stream',
   LOG_STREAM_END: 'log-stream-end',
   PING: 'ping',
-  PONG: 'pong'
+  PONG: 'pong',
+  COLLECT_REQ: 'collect-req',
+  COLLECT_ACK: 'collect-ack',
+  COLLECT_DATA: 'collect-data',
+  COLLECT_END: 'collect-end',
+  HEALTH_STATS: 'health-stats'
 };
 
 const LOG_LEVELS = ['DEBUG', 'INFO', 'WARN', 'ERROR'];
@@ -76,6 +81,26 @@ function makePong(ts, t1) {
   return { type: MSG_TYPE.PONG, ts, t1: t1 || 0, t2: Date.now() };
 }
 
+function makeCollectReq(collectId, sourceId, targetId) {
+  return { type: MSG_TYPE.COLLECT_REQ, collectId, sourceId, targetId, ts: Date.now() };
+}
+
+function makeCollectAck(collectId, sourceId, targetId, totalSize, chunkCount) {
+  return { type: MSG_TYPE.COLLECT_ACK, collectId, sourceId, targetId, totalSize, chunkCount, ts: Date.now() };
+}
+
+function makeCollectData(collectId, sourceId, targetId, chunkIndex, chunkCount, data) {
+  return { type: MSG_TYPE.COLLECT_DATA, collectId, sourceId, targetId, chunkIndex, chunkCount, data, ts: Date.now() };
+}
+
+function makeCollectEnd(collectId, sourceId, targetId, chunkCount, checksum) {
+  return { type: MSG_TYPE.COLLECT_END, collectId, sourceId, targetId, chunkCount, checksum, ts: Date.now() };
+}
+
+function makeHealthStats(sourceId, windowMs, perLevel, buckets) {
+  return { type: MSG_TYPE.HEALTH_STATS, sourceId, windowMs, perLevel, buckets, ts: Date.now() };
+}
+
 module.exports = {
   MSG_TYPE,
   LOG_LEVELS,
@@ -93,5 +118,10 @@ module.exports = {
   makeLogStream,
   makeLogStreamEnd,
   makePing,
-  makePong
+  makePong,
+  makeCollectReq,
+  makeCollectAck,
+  makeCollectData,
+  makeCollectEnd,
+  makeHealthStats
 };

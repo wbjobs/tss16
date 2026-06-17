@@ -553,3 +553,257 @@ html, body {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
 }
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-right: 16px;
+  padding-right: 16px;
+  border-right: 1px solid var(--border);
+}
+
+.tab-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  padding: 5px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-weight: 600;
+  transition: all 0.15s;
+}
+
+.tab-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.tab-btn.active {
+  background: var(--bg-tertiary);
+  border-color: var(--border);
+  color: var(--accent);
+}
+
+.tab-panel {
+  display: none;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tab-panel.active {
+  display: flex;
+}
+
+.node-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.btn-mini {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: var(--font-sans);
+  transition: all 0.15s;
+}
+
+.btn-mini:hover {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: white;
+}
+
+.dashboard {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  overflow: auto;
+}
+
+.dashboard-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.summary-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.summary-card .summary-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.summary-card .summary-value {
+  font-size: 24px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+}
+
+.summary-card .summary-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.chart-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.chart-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  min-height: 280px;
+  display: flex;
+  flex-direction: column;
+}
+
+.chart-card.chart-wide {
+  grid-column: 1 / -1;
+}
+
+.chart-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.chart {
+  flex: 1;
+  min-height: 230px;
+}
+
+.collect-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.collect-modal-content {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: 500px;
+  max-width: 90vw;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.collect-modal-header,
+.collect-modal-footer {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.collect-modal-footer {
+  border-bottom: none;
+  border-top: 1px solid var(--border);
+  gap: 8px;
+}
+
+.collect-modal-header span {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+#collectBody {
+  padding: 18px;
+}
+
+.collect-target {
+  font-size: 13px;
+  margin-bottom: 16px;
+  color: var(--text-secondary);
+}
+
+.collect-target span {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+.collect-progress-wrap {
+  margin-bottom: 10px;
+}
+
+.collect-progress-bar {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  height: 12px;
+  overflow: hidden;
+}
+
+.collect-progress-fill {
+  background: linear-gradient(90deg, var(--accent), #7ee787);
+  height: 100%;
+  width: 0%;
+  transition: width 0.2s ease;
+}
+
+.collect-progress-text {
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  font-family: var(--font-mono);
+}
+
+.collect-status {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  min-height: 18px;
+}
+
+.btn-close {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 22px;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.btn-close:hover {
+  color: var(--text-primary);
+}
+
+.node-item {
+  padding-bottom: 6px;
+}
+

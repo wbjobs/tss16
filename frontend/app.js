@@ -10,7 +10,12 @@ const MSG_TYPE = {
   LOG_STREAM: 'log-stream',
   LOG_STREAM_END: 'log-stream-end',
   PING: 'ping',
-  PONG: 'pong'
+  PONG: 'pong',
+  COLLECT_REQ: 'collect-req',
+  COLLECT_ACK: 'collect-ack',
+  COLLECT_DATA: 'collect-data',
+  COLLECT_END: 'collect-end',
+  HEALTH_STATS: 'health-stats'
 };
 
 const LOG_LEVEL_ORDER = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
@@ -245,6 +250,11 @@ class LogGrid {
     this.wsReconnectAttempts = 0;
     this.signalUrl = '';
     this.sortDirty = false;
+
+    this.healthData = new Map();
+    this.activeCollects = new Map();
+    this.charts = {};
+    this.currentTab = 'logs';
 
     this.virtualScroll = null;
   }
@@ -514,6 +524,22 @@ class LogGrid {
         }
         break;
       }
+      case MSG_TYPE.HEALTH_STATS: {
+        this._handleHealthStats(fromId, msg);
+        break;
+      }
+      case MSG_TYPE.COLLECT_ACK: {
+        this._handleCollectAck(msg);
+        break;
+      }
+      case MSG_TYPE.COLLECT_DATA: {
+        this._handleCollectData(msg);
+        break;
+      }
+      case MSG_TYPE.COLLECT_END: {
+        this._handleCollectEnd(msg);
+        break;
+      }
     }
   }
 
@@ -616,10 +642,19 @@ class LogGrid {
           <div class="node-info">
             <div class="node-name${peer.dead ? ' node-name-dead' : ''}" title="${id}">${hostname}</div>
             <div class="node-meta">${metaParts.join(' · ')}</div>
+            ${(!peer.dead && peer.connected) ? `<div class="node-actions"><button class="btn-mini" data-collect="${id}">🚨 紧急采集</button></div>` : ''}
           </div>
         </div>`;
       }
       container.innerHTML = html;
+
+      container.querySelectorAll('[data-collect]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const nodeId = btn.getAttribute('data-collect');
+          this.startEmergencyCollect(nodeId);
+        });
+      });
     }
 
     const queryBtn = document.getElementById('queryBtn');
@@ -672,6 +707,282 @@ class LogGrid {
     this.wsReconnectAttempts = 0;
     this.updateStatus('', '未连接');
     this._updateNodeList();
+  }
+
+  switchTab(tab) {
+    this.currentTab = tab;
+    document.querySelectorAll('.tab-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.tab === tab);
+    });
+    document.querySelectorAll('.tab-panel').forEach(p => {
+      p.classList.toggle('active', p.id === `tab-${tab}`);
+    });
+    const showLogs = tab === 'logs';
+    ['logsToolbar', 'logsToolbar2', 'logsToolbar3'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.style.display = showLogs ? '' : 'none';
+    });
+    document.getElementById('queryBtn').style.display = showLogs ? '' : 'none';
+    document.getElementById('stopBtn').style.display = showLogs ? '' : 'none';
+    if (tab === 'dashboard') {
+      setTimeout(() => this._initCharts(), 50);
+    }
+  }
+
+  _initCharts() {
+    if (!window.echarts) return;
+    const ids = ['chartErrors', 'chartThroughput', 'chartLevelDist'];
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      if (!el || this.charts[id]) continue;
+      this.charts[id] = echarts.init(el, 'dark');
+    }
+    this._renderDashboard();
+    window.addEventListener('resize', () => {
+      for (const c of Object.values(this.charts)) {
+        try { c.resize(); } catch {}
+      }
+    });
+  }
+
+  _handleHealthStats(fromId, msg) {
+    const entry = {
+      ts: Date.now(),
+      perLevel: msg.perLevel || {},
+      buckets: msg.buckets || []
+    };
+    const history = this.healthData.get(fromId) || [];
+    history.push(entry);
+    while (history.length > 60) history.shift();
+    this.healthData.set(fromId, history);
+
+    if (this.currentTab === 'dashboard') {
+      this._renderDashboard();
+    }
+  }
+
+  _renderDashboard() {
+    const totalStats = { DEBUG: 0, INFO: 0, WARN: 0, ERROR: 0, total: 0 };
+    const nodeSummaries = [];
+    let allBuckets = [];
+    for (const [nodeId, history] of this.healthData) {
+      const latest = history[history.length - 1];
+      if (!latest) continue;
+      const info = this.nodeInfo.get(nodeId) || {};
+      const hostname = info.hostname || nodeId.slice(0, 20);
+      const peer = this.peers.get(nodeId);
+      const dead = peer ? peer.dead : false;
+      for (const k of Object.keys(totalStats)) {
+        totalStats[k] += latest.perLevel[k] || 0;
+      }
+      const errRate = latest.perLevel.total > 0
+        ? ((latest.perLevel.ERROR / latest.perLevel.total) * 100).toFixed(1) + '%'
+        : '0%';
+      nodeSummaries.push({ nodeId, hostname, dead, latest, errRate });
+      for (const b of latest.buckets) {
+        allBuckets.push({ ...b, nodeId, hostname });
+      }
+    }
+
+    const sumEl = document.getElementById('dashboardSummary');
+    if (sumEl) {
+      const cards = [
+        { label: '在线节点', value: nodeSummaries.filter(n => !n.dead).length, sub: `共 ${nodeSummaries.length} 个`, color: 'var(--accent)' },
+        { label: '日志总数（1分钟）', value: totalStats.total.toLocaleString(), sub: '各节点汇总', color: 'var(--text-primary)' },
+        { label: 'ERROR', value: totalStats.ERROR.toLocaleString(), sub: '近 1 分钟', color: 'var(--danger)' },
+        { label: 'WARN', value: totalStats.WARN.toLocaleString(), sub: '近 1 分钟', color: 'var(--warning)' }
+      ];
+      sumEl.innerHTML = cards.map(c => `
+        <div class="summary-card">
+          <div class="summary-label">${c.label}</div>
+          <div class="summary-value" style="color:${c.color}">${c.value}</div>
+          <div class="summary-sub">${c.sub}</div>
+        </div>
+      `).join('');
+    }
+
+    if (!this.charts.chartErrors || !this.charts.chartThroughput || !this.charts.chartLevelDist) return;
+
+    const bucketMap = new Map();
+    const nodeNames = new Map();
+    for (const b of allBuckets) {
+      const key = b.ts;
+      if (!bucketMap.has(key)) bucketMap.set(key, {});
+      const m = bucketMap.get(key);
+      nodeNames.set(b.nodeId, b.hostname);
+      if (!m[b.nodeId]) m[b.nodeId] = { ERROR: 0, total: 0 };
+      m[b.nodeId].ERROR += b.ERROR || 0;
+      m[b.nodeId].total += b.total || 0;
+    }
+    const times = Array.from(bucketMap.keys()).sort((a, b) => a - b);
+    const timeLabels = times.map(t => new Date(t).toLocaleTimeString('zh-CN', { hour12: false }));
+
+    const errSeries = [];
+    const tpSeries = [];
+    const colors = ['#58a6ff', '#3fb950', '#f85149', '#d29922', '#bc8cff', '#f778ba'];
+    let ci = 0;
+    for (const [nodeId, hostname] of nodeNames) {
+      const color = colors[ci++ % colors.length];
+      errSeries.push({
+        name: hostname,
+        type: 'line',
+        smooth: true,
+        showSymbol: false,
+        lineStyle: { color, width: 2 },
+        itemStyle: { color },
+        data: times.map(t => {
+          const b = bucketMap.get(t)[nodeId];
+          if (!b || !b.total) return 0;
+          return +((b.ERROR / b.total) * 100).toFixed(2);
+        })
+      });
+      tpSeries.push({
+        name: hostname,
+        type: 'line',
+        smooth: true,
+        showSymbol: false,
+        lineStyle: { color, width: 2 },
+        itemStyle: { color },
+        areaStyle: { opacity: 0.1 },
+        data: times.map(t => bucketMap.get(t)[nodeId]?.total || 0)
+      });
+    }
+
+    this.charts.chartErrors.setOption({
+      backgroundColor: 'transparent',
+      tooltip: { trigger: 'axis' },
+      legend: { top: 0, textStyle: { color: '#8b949e', fontSize: 11 } },
+      grid: { left: 40, right: 16, top: 30, bottom: 28 },
+      xAxis: { type: 'category', data: timeLabels, axisLabel: { color: '#8b949e', fontSize: 10 } },
+      yAxis: { type: 'value', name: '错误率 %', axisLabel: { color: '#8b949e', fontSize: 10 }, nameTextStyle: { color: '#8b949e', fontSize: 10 } },
+      series: errSeries
+    }, true);
+
+    this.charts.chartThroughput.setOption({
+      backgroundColor: 'transparent',
+      tooltip: { trigger: 'axis' },
+      legend: { top: 0, textStyle: { color: '#8b949e', fontSize: 11 } },
+      grid: { left: 40, right: 16, top: 30, bottom: 28 },
+      xAxis: { type: 'category', data: timeLabels, axisLabel: { color: '#8b949e', fontSize: 10 } },
+      yAxis: { type: 'value', name: '条/10秒', axisLabel: { color: '#8b949e', fontSize: 10 }, nameTextStyle: { color: '#8b949e', fontSize: 10 } },
+      series: tpSeries
+    }, true);
+
+    this.charts.chartLevelDist.setOption({
+      backgroundColor: 'transparent',
+      tooltip: { trigger: 'item' },
+      legend: { top: 0, textStyle: { color: '#8b949e', fontSize: 11 } },
+      series: [{
+        type: 'pie',
+        radius: ['40%', '70%'],
+        avoidLabelOverlap: true,
+        label: { color: '#e6edf3', fontSize: 12 },
+        data: [
+          { value: totalStats.ERROR, name: 'ERROR', itemStyle: { color: '#f85149' } },
+          { value: totalStats.WARN, name: 'WARN', itemStyle: { color: '#d29922' } },
+          { value: totalStats.INFO, name: 'INFO', itemStyle: { color: '#58a6ff' } },
+          { value: totalStats.DEBUG, name: 'DEBUG', itemStyle: { color: '#8b949e' } }
+        ]
+      }]
+    }, true);
+  }
+
+  startEmergencyCollect(nodeId) {
+    const info = this.nodeInfo.get(nodeId) || {};
+    const hostname = info.hostname || nodeId;
+    const collectId = `collect-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const state = {
+      nodeId, hostname, collectId,
+      totalSize: 0, chunkCount: 0,
+      receivedChunks: new Map(),
+      startedAt: Date.now(),
+      finished: false
+    };
+    this.activeCollects.set(collectId, state);
+
+    document.getElementById('collectTargetName').textContent = hostname;
+    document.getElementById('collectFill').style.width = '0%';
+    document.getElementById('collectProgressText').textContent = '等待响应...';
+    document.getElementById('collectStatus').textContent = '正在发送采集指令...';
+    document.getElementById('downloadCollectBtn').disabled = true;
+    document.getElementById('collectModal').style.display = 'flex';
+
+    const req = { type: MSG_TYPE.COLLECT_REQ, collectId, sourceId: this.nodeId, targetId: nodeId, ts: Date.now() };
+    const peer = this.peers.get(nodeId);
+    if (peer && peer.connected && !peer.dead) {
+      peer.send(req);
+    } else {
+      this.sendRelay(nodeId, req);
+    }
+  }
+
+  _handleCollectAck(msg) {
+    const st = this.activeCollects.get(msg.collectId);
+    if (!st) return;
+    st.totalSize = msg.totalSize;
+    st.chunkCount = msg.chunkCount;
+    document.getElementById('collectStatus').textContent =
+      `接收分片：0 / ${msg.chunkCount}（${(msg.totalSize/1024).toFixed(1)} KB）`;
+    document.getElementById('collectProgressText').textContent = `0 / ${msg.chunkCount}`;
+  }
+
+  _handleCollectData(msg) {
+    const st = this.activeCollects.get(msg.collectId);
+    if (!st || st.finished) return;
+    st.receivedChunks.set(msg.chunkIndex, msg.data);
+    const got = st.receivedChunks.size;
+    const total = st.chunkCount;
+    const pct = total ? (got / total * 100).toFixed(1) : 0;
+    document.getElementById('collectFill').style.width = `${pct}%`;
+    document.getElementById('collectProgressText').textContent = `${got} / ${total}  (${pct}%)`;
+    document.getElementById('collectStatus').textContent =
+      `接收分片：${got} / ${total} · ${(st.totalSize/1024).toFixed(1)} KB`;
+  }
+
+  _handleCollectEnd(msg) {
+    const st = this.activeCollects.get(msg.collectId);
+    if (!st) return;
+    const ordered = [];
+    for (let i = 0; i < st.chunkCount; i++) {
+      const c = st.receivedChunks.get(i);
+      if (c == null) {
+        document.getElementById('collectStatus').textContent = `❌ 缺失分片 #${i}，传输失败`;
+        return;
+      }
+      ordered.push(c);
+    }
+    try {
+      const b64 = ordered.join('');
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const blob = new Blob([bytes], { type: 'text/plain;charset=utf-8' });
+      st.blob = blob;
+      st.fileName = `emergency-log-${st.hostname}-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+      st.finished = true;
+
+      document.getElementById('collectFill').style.width = '100%';
+      document.getElementById('collectProgressText').textContent = `✓ 完成 (${(blob.size/1024).toFixed(1)} KB)`;
+      document.getElementById('collectStatus').textContent =
+        `✓ 采集完成，共 ${st.chunkCount} 个分片，${(blob.size/1024).toFixed(1)} KB`;
+      document.getElementById('downloadCollectBtn').disabled = false;
+      document.getElementById('downloadCollectBtn').onclick = () => this._downloadCollect(msg.collectId);
+    } catch (e) {
+      document.getElementById('collectStatus').textContent = `❌ 重组失败: ${e.message}`;
+    }
+  }
+
+  _downloadCollect(collectId) {
+    const st = this.activeCollects.get(collectId);
+    if (!st || !st.blob) return;
+    const url = URL.createObjectURL(st.blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = st.fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
 }
 
@@ -867,5 +1178,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
   document.getElementById('closeDetailBtn').addEventListener('click', () => {
     document.getElementById('logDetail').style.display = 'none';
+  });
+
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => grid.switchTab(btn.dataset.tab));
+  });
+
+  const closeCollect = () => {
+    document.getElementById('collectModal').style.display = 'none';
+  };
+  document.getElementById('closeCollectBtn').addEventListener('click', closeCollect);
+  document.getElementById('cancelCollectBtn').addEventListener('click', closeCollect);
+  document.getElementById('collectModal').addEventListener('click', (e) => {
+    if (e.target.id === 'collectModal') closeCollect();
   });
 });
