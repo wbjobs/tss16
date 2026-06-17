@@ -22,6 +22,19 @@ const RTC_CONFIG = {
   ]
 };
 
+const PING_INTERVAL_MS = 5000;
+const PING_TIMEOUT_MS = 15000;
+const RECONNECT_BASE_DELAY = 2000;
+const RECONNECT_MAX_DELAY = 30000;
+
+function makePing() {
+  return { type: MSG_TYPE.PING, ts: Date.now(), t1: Date.now() };
+}
+
+function makePong(ts, t1) {
+  return { type: MSG_TYPE.PONG, ts, t1: t1 || 0, t2: Date.now() };
+}
+
 class PeerConnection {
   constructor(nodeId, grid) {
     this.nodeId = nodeId;
@@ -30,6 +43,13 @@ class PeerConnection {
     this.dc = null;
     this.connected = false;
     this.relayOnly = false;
+    this.lastPongAt = Date.now();
+    this.lastPingAt = 0;
+    this.clockOffset = 0;
+    this.rtt = 0;
+    this.reconnectAttempts = 0;
+    this.reconnectTimer = null;
+    this.dead = false;
   }
 
   async initiate() {
@@ -100,7 +120,10 @@ class PeerConnection {
       if (state === 'connected') {
         this.connected = true;
         this.relayOnly = false;
-        this.grid.onPeerConnected(this.nodeId);
+        this.dead = false;
+        this.lastPongAt = Date.now();
+        this.reconnectAttempts = 0;
+        this.grid.onPeerStateChange(this.nodeId);
       } else if (state === 'failed' || state === 'disconnected') {
         this._fallbackToRelay();
       }
@@ -119,10 +142,16 @@ class PeerConnection {
       console.log(`[Peer:${this.nodeId}] data channel open`);
       this.connected = true;
       this.relayOnly = false;
-      this.grid.onPeerConnected(this.nodeId);
+      this.dead = false;
+      this.lastPongAt = Date.now();
+      this.reconnectAttempts = 0;
+      this.grid.onPeerStateChange(this.nodeId);
     };
     dc.onclose = () => {
       console.log(`[Peer:${this.nodeId}] data channel closed`);
+      this._fallbackToRelay();
+    };
+    dc.onerror = () => {
       this._fallbackToRelay();
     };
     dc.onmessage = (evt) => {
@@ -142,23 +171,60 @@ class PeerConnection {
     }
     this.relayOnly = true;
     this.connected = true;
+    this.dead = false;
+    this.lastPongAt = Date.now();
+    this.reconnectAttempts = 0;
     console.log(`[Peer:${this.nodeId}] using relay mode`);
-    this.grid.onPeerConnected(this.nodeId);
+    this.grid.onPeerStateChange(this.nodeId);
+  }
+
+  markDead() {
+    if (this.dead) return;
+    this.dead = true;
+    this.connected = false;
+    console.warn(`[Peer:${this.nodeId}] MARKED DEAD (no pong for ${PING_TIMEOUT_MS}ms)`);
+    this.grid.onPeerStateChange(this.nodeId);
+    this._scheduleReconnect();
+  }
+
+  _scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    this.reconnectAttempts++;
+    const delay = Math.min(
+      RECONNECT_BASE_DELAY * Math.pow(2, this.reconnectAttempts - 1),
+      RECONNECT_MAX_DELAY
+    );
+    console.log(`[Peer:${this.nodeId}] scheduling reconnect in ${delay}ms (attempt ${this.reconnectAttempts})`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.pc = null;
+      this.dc = null;
+      if (this.grid.nodeInfo.has(this.nodeId)) {
+        this.initiate();
+      }
+    }, delay);
   }
 
   send(msg) {
     const payload = JSON.stringify(msg);
     if (this.dc && this.dc.readyState === 'open') {
-      this.dc.send(payload);
-    } else {
-      this.grid.sendRelay(this.nodeId, msg);
+      try {
+        this.dc.send(payload);
+        return;
+      } catch {}
     }
+    this.grid.sendRelay(this.nodeId, msg);
   }
 
   close() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.dc) try { this.dc.close(); } catch {}
     if (this.pc) try { this.pc.close(); } catch {}
     this.connected = false;
+    this.dead = true;
   }
 }
 
@@ -175,11 +241,16 @@ class LogGrid {
     this.stats = { total: 0, ERROR: 0, WARN: 0, INFO: 0, DEBUG: 0 };
     this.autoScroll = true;
     this.sources = new Set();
+    this.reconnectTimer = null;
+    this.wsReconnectAttempts = 0;
+    this.signalUrl = '';
+    this.sortDirty = false;
 
     this.virtualScroll = null;
   }
 
   connect(signalUrl) {
+    this.signalUrl = signalUrl;
     this.updateStatus('connecting', '连接中...');
     this.ws = new WebSocket(signalUrl);
 
@@ -189,6 +260,7 @@ class LogGrid {
         nodeId: this.nodeId,
         info: { role: 'frontend' }
       }));
+      this.wsReconnectAttempts = 0;
       this.updateStatus('connected', '已连接');
     };
 
@@ -199,11 +271,33 @@ class LogGrid {
 
     this.ws.onclose = () => {
       this.updateStatus('', '已断开');
+      for (const [, peer] of this.peers) {
+        if (!peer.relayOnly) {
+          peer.markDead();
+        }
+      }
+      this._scheduleSignalReconnect();
     };
 
     this.ws.onerror = () => {
       this.updateStatus('', '连接失败');
+      this._scheduleSignalReconnect();
     };
+  }
+
+  _scheduleSignalReconnect() {
+    if (this.reconnectTimer) return;
+    if (!this.signalUrl) return;
+    this.wsReconnectAttempts++;
+    const delay = Math.min(
+      RECONNECT_BASE_DELAY * Math.pow(2, this.wsReconnectAttempts - 1),
+      RECONNECT_MAX_DELAY
+    );
+    this.updateStatus('connecting', `重连中 (${this.wsReconnectAttempts})...`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect(this.signalUrl);
+    }, delay);
   }
 
   _handleSignalMessage(msg) {
@@ -236,7 +330,17 @@ class LogGrid {
 
   _connectToPeer(peerId) {
     if (peerId === this.nodeId) return;
-    if (this.peers.has(peerId)) return;
+    if (this.peers.has(peerId)) {
+      const existing = this.peers.get(peerId);
+      if (existing.dead) {
+        if (existing.reconnectTimer) {
+          clearTimeout(existing.reconnectTimer);
+          existing.reconnectTimer = null;
+        }
+        existing.initiate();
+      }
+      return;
+    }
 
     const peer = new PeerConnection(peerId, this);
     this.peers.set(peerId, peer);
@@ -260,7 +364,7 @@ class LogGrid {
     peer.handleSignal(signal);
   }
 
-  onPeerConnected(nodeId) {
+  onPeerStateChange(nodeId) {
     this._updateNodeList();
   }
 
@@ -281,6 +385,33 @@ class LogGrid {
         targetId,
         data: msg
       }));
+    }
+  }
+
+  startHeartbeat() {
+    if (this._pingInterval) return;
+    this._pingInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [peerId, peer] of this.peers) {
+        if (peer.connected && !peer.dead) {
+          peer.lastPingAt = now;
+          peer.send(makePing());
+        }
+        if (!peer.dead && now - peer.lastPongAt > PING_TIMEOUT_MS) {
+          peer.markDead();
+        }
+      }
+      if (this.sortDirty) {
+        this._sortLogs();
+        this.sortDirty = false;
+      }
+    }, PING_INTERVAL_MS);
+  }
+
+  stopHeartbeat() {
+    if (this._pingInterval) {
+      clearInterval(this._pingInterval);
+      this._pingInterval = null;
     }
   }
 
@@ -308,11 +439,13 @@ class LogGrid {
       }
     }
 
+    this.startHeartbeat();
     this.virtualScroll.setItems([]);
     return queryId;
   }
 
   stopQuery() {
+    this.stopHeartbeat();
     if (!this.activeQueryId) return;
 
     const cancel = {
@@ -330,8 +463,18 @@ class LogGrid {
     this.activeQueryId = null;
   }
 
+  getClockOffset(nodeId) {
+    const peer = this.peers.get(nodeId);
+    return peer ? peer.clockOffset : 0;
+  }
+
   handleMeshMessage(fromId, msg) {
     if (!msg || !msg.type) return;
+
+    const peer = this.peers.get(fromId);
+    if (peer && !peer.dead) {
+      peer.lastPongAt = Date.now();
+    }
 
     switch (msg.type) {
       case MSG_TYPE.LOG_STREAM:
@@ -341,9 +484,47 @@ class LogGrid {
         break;
       case MSG_TYPE.LOG_STREAM_END:
         break;
-      case MSG_TYPE.PONG:
+      case MSG_TYPE.PING: {
+        if (peer) {
+          peer.lastPongAt = Date.now();
+        }
+        const sendMsg = makePong(msg.ts, msg.t1);
+        if (peer && peer.connected) {
+          peer.send(sendMsg);
+        } else {
+          this.sendRelay(fromId, sendMsg);
+        }
         break;
+      }
+      case MSG_TYPE.PONG: {
+        if (peer) {
+          const now = Date.now();
+          const t1 = msg.t1 || peer.lastPingAt;
+          const t2 = msg.t2 || msg.ts;
+          const t3 = now;
+          const rtt = t3 - t1;
+          const offset = t2 - (t1 + t3) / 2;
+          peer.rtt = rtt;
+          peer.clockOffset = offset;
+          peer.lastPongAt = now;
+          peer.dead = false;
+          peer.connected = true;
+          this._updateNodeList();
+          this.sortDirty = true;
+        }
+        break;
+      }
     }
+  }
+
+  _sortLogs() {
+    if (this.logs.length === 0) return;
+    for (const entry of this.logs) {
+      entry.calibratedTimestamp = entry.timestamp - this.getClockOffset(entry.nodeId);
+    }
+    this.logs.sort((a, b) => a.calibratedTimestamp - b.calibratedTimestamp);
+    this.filteredLogs = this.logs.filter(e => this._matchesLocalFilter(e));
+    this.virtualScroll.setItems(this.filteredLogs);
   }
 
   _addLog(entry) {
@@ -354,6 +535,7 @@ class LogGrid {
       }
     }
 
+    entry.calibratedTimestamp = entry.timestamp - this.getClockOffset(entry.nodeId);
     this.logs.push(entry);
     this.stats.total++;
     this.stats[entry.level] = (this.stats[entry.level] || 0) + 1;
@@ -401,28 +583,48 @@ class LogGrid {
     const container = document.getElementById('nodeList');
     if (this.peers.size === 0) {
       container.innerHTML = '<div class="node-empty">暂无节点</div>';
-      return;
-    }
+    } else {
+      let html = '';
+      for (const [id, peer] of this.peers) {
+        const info = this.nodeInfo.get(id) || {};
+        const hostname = info.hostname || id;
+        const platform = info.platform || '';
+        const offset = peer.clockOffset;
+        const offsetStr = Math.abs(offset) < 1 ? '' : (offset > 0 ? `+${offset.toFixed(0)}ms` : `${offset.toFixed(0)}ms`);
+        const rttStr = peer.rtt ? `${peer.rtt}ms` : '';
 
-    let html = '';
-    for (const [id, peer] of this.peers) {
-      const info = this.nodeInfo.get(id) || {};
-      const isRelay = peer.relayOnly;
-      const hostname = info.hostname || id;
-      const platform = info.platform || '';
+        let statusClass = '';
+        let statusLabel = '';
+        if (peer.dead) {
+          statusClass = 'dead';
+          statusLabel = '离线';
+        } else if (peer.relayOnly) {
+          statusClass = 'relay';
+          statusLabel = 'Relay';
+        } else {
+          statusClass = '';
+          statusLabel = 'P2P';
+        }
 
-      html += `<div class="node-item">
-        <div class="node-dot${isRelay ? ' relay' : ''}"></div>
-        <div class="node-info">
-          <div class="node-name" title="${id}">${hostname}</div>
-          <div class="node-meta">${isRelay ? 'Relay' : 'P2P'}${platform ? ' · ' + platform : ''}</div>
-        </div>
-      </div>`;
+        const metaParts = [statusLabel];
+        if (platform) metaParts.push(platform);
+        if (rttStr) metaParts.push(rttStr);
+        if (offsetStr) metaParts.push(`Δ${offsetStr}`);
+
+        html += `<div class="node-item">
+          <div class="node-dot${statusClass ? ' ' + statusClass : ''}" title="${statusLabel}"></div>
+          <div class="node-info">
+            <div class="node-name${peer.dead ? ' node-name-dead' : ''}" title="${id}">${hostname}</div>
+            <div class="node-meta">${metaParts.join(' · ')}</div>
+          </div>
+        </div>`;
+      }
+      container.innerHTML = html;
     }
-    container.innerHTML = html;
 
     const queryBtn = document.getElementById('queryBtn');
-    queryBtn.disabled = !Array.from(this.peers.values()).some(p => p.connected);
+    const hasLive = Array.from(this.peers.values()).some(p => p.connected && !p.dead);
+    queryBtn.disabled = !hasLive;
   }
 
   _updateSourceFilter() {
@@ -451,16 +653,23 @@ class LogGrid {
   }
 
   disconnect() {
+    this.stopHeartbeat();
     this.stopQuery();
     for (const [, peer] of this.peers) {
       peer.close();
     }
     this.peers.clear();
     this.nodeInfo.clear();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
+    this.signalUrl = '';
+    this.wsReconnectAttempts = 0;
     this.updateStatus('', '未连接');
     this._updateNodeList();
   }
@@ -542,7 +751,9 @@ class VirtualScroll {
     row.style.top = `${index * this.rowHeight}px`;
     row.style.height = `${this.rowHeight}px`;
 
-    const time = new Date(entry.timestamp).toLocaleTimeString('zh-CN', {
+    const displayTs = entry.calibratedTimestamp || entry.timestamp;
+    const dt = new Date(displayTs);
+    const time = dt.toLocaleTimeString('zh-CN', {
       hour12: false,
       hour: '2-digit',
       minute: '2-digit',
@@ -630,8 +841,8 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('stopBtn').addEventListener('click', () => {
     grid.stopQuery();
     document.getElementById('stopBtn').disabled = true;
-    const hasConnected = Array.from(grid.peers.values()).some(p => p.connected);
-    document.getElementById('queryBtn').disabled = !hasConnected;
+    const hasLive = Array.from(grid.peers.values()).some(p => p.connected && !p.dead);
+    document.getElementById('queryBtn').disabled = !hasLive;
   });
 
   document.getElementById('autoScroll').addEventListener('change', (evt) => {

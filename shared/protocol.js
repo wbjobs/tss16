@@ -68,12 +68,12 @@ function makeLogStreamEnd(queryId, sourceId) {
   return { type: MSG_TYPE.LOG_STREAM_END, queryId, sourceId };
 }
 
-function makePing() {
-  return { type: MSG_TYPE.PING, ts: Date.now() };
+function makePing(ts) {
+  return { type: MSG_TYPE.PING, ts: ts || Date.now(), t1: Date.now() };
 }
 
-function makePong(ts) {
-  return { type: MSG_TYPE.PONG, ts };
+function makePong(ts, t1) {
+  return { type: MSG_TYPE.PONG, ts, t1: t1 || 0, t2: Date.now() };
 }
 
 module.exports = {

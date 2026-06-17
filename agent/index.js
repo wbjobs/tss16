@@ -31,6 +31,11 @@ const NODE_ID = process.env.NODE_ID || `agent-${os.hostname()}-${process.pid}`;
 const LOG_DIR = process.env.LOG_DIR || '';
 const SIMULATE = process.argv.includes('--simulate');
 
+const PING_INTERVAL_MS = 5000;
+const PING_TIMEOUT_MS = 15000;
+const RECONNECT_BASE_DELAY = 2000;
+const RECONNECT_MAX_DELAY = 30000;
+
 const log = (...args) => console.log(`[${NODE_ID}]`, ...args);
 
 class PeerConnection {
@@ -42,13 +47,24 @@ class PeerConnection {
     this.isInitiator = false;
     this.connected = false;
     this.relayOnly = false;
+    this.lastPongAt = Date.now();
+    this.lastPingAt = 0;
+    this.clockOffset = 0;
+    this.rtt = 0;
+    this.reconnectAttempts = 0;
+    this.reconnectTimer = null;
+    this.dead = false;
   }
 
   async initiate() {
     if (!wrtc) {
       this.relayOnly = true;
-      log(`peer ${this.nodeId}: relay-only mode`);
       this.connected = true;
+      this.dead = false;
+      this.lastPongAt = Date.now();
+      this.reconnectAttempts = 0;
+      log(`peer ${this.nodeId}: relay-only mode`);
+      this.agent.onPeerStateChange(this.nodeId);
       return;
     }
 
@@ -75,7 +91,10 @@ class PeerConnection {
     if (!wrtc) {
       this.relayOnly = true;
       this.connected = true;
+      this.dead = false;
+      this.lastPongAt = Date.now();
       this.agent.sendSignal(this.nodeId, { type: 'relay-fallback' });
+      this.agent.onPeerStateChange(this.nodeId);
       return;
     }
 
@@ -124,6 +143,10 @@ class PeerConnection {
       if (state === 'connected') {
         this.connected = true;
         this.relayOnly = false;
+        this.dead = false;
+        this.lastPongAt = Date.now();
+        this.reconnectAttempts = 0;
+        this.agent.onPeerStateChange(this.nodeId);
       } else if (state === 'failed' || state === 'disconnected') {
         this._fallbackToRelay();
       }
@@ -143,9 +166,16 @@ class PeerConnection {
       log(`peer ${this.nodeId}: data channel open`);
       this.connected = true;
       this.relayOnly = false;
+      this.dead = false;
+      this.lastPongAt = Date.now();
+      this.reconnectAttempts = 0;
+      this.agent.onPeerStateChange(this.nodeId);
     };
     dc.onclose = () => {
       log(`peer ${this.nodeId}: data channel closed`);
+      this._fallbackToRelay();
+    };
+    dc.onerror = () => {
       this._fallbackToRelay();
     };
     dc.onmessage = (evt) => {
@@ -162,19 +192,54 @@ class PeerConnection {
     }
     this.relayOnly = true;
     this.connected = true;
+    this.dead = false;
+    this.lastPongAt = Date.now();
+    this.reconnectAttempts = 0;
     log(`peer ${this.nodeId}: fell back to relay mode`);
+    this.agent.onPeerStateChange(this.nodeId);
+  }
+
+  markDead() {
+    if (this.dead) return;
+    this.dead = true;
+    this.connected = false;
+    log(`peer ${this.nodeId}: marked DEAD (no pong for ${PING_TIMEOUT_MS}ms)`);
+    this.agent.onPeerStateChange(this.nodeId);
+    this._scheduleReconnect();
+  }
+
+  _scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    this.reconnectAttempts++;
+    const delay = Math.min(
+      RECONNECT_BASE_DELAY * Math.pow(2, this.reconnectAttempts - 1),
+      RECONNECT_MAX_DELAY
+    );
+    log(`peer ${this.nodeId}: reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.pc = null;
+      this.dc = null;
+      this.initiate();
+    }, delay);
   }
 
   send(msg) {
     const payload = encode(msg);
     if (this.dc && this.dc.readyState === 'open') {
-      this.dc.send(payload);
-    } else {
-      this.agent.sendRelay(this.nodeId, msg);
+      try {
+        this.dc.send(payload);
+        return;
+      } catch {}
     }
+    this.agent.sendRelay(this.nodeId, msg);
   }
 
   close() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.dc) {
       try { this.dc.close(); } catch {}
     }
@@ -182,6 +247,7 @@ class PeerConnection {
       try { this.pc.close(); } catch {}
     }
     this.connected = false;
+    this.dead = true;
   }
 }
 
@@ -343,6 +409,7 @@ class Agent {
     this.seenQueryIds = new Set();
     this.maxSeenQueries = 1000;
     this.reconnectTimer = null;
+    this.wsReconnectAttempts = 0;
   }
 
   async start() {
@@ -354,12 +421,17 @@ class Agent {
     this.tailer.start();
 
     this._pingInterval = setInterval(() => {
+      const now = Date.now();
       for (const [peerId, peer] of this.peers) {
-        if (peer.connected) {
+        if (peer.connected && !peer.dead) {
+          peer.lastPingAt = now;
           peer.send(makePing());
         }
+        if (!peer.dead && now - peer.lastPongAt > PING_TIMEOUT_MS) {
+          peer.markDead();
+        }
       }
-    }, 30000);
+    }, PING_INTERVAL_MS);
   }
 
   _connectSignal() {
@@ -368,6 +440,7 @@ class Agent {
 
     this.ws.on('open', () => {
       log('connected to signaling server');
+      this.wsReconnectAttempts = 0;
       this.ws.send(encode(makeRegister(NODE_ID, {
         role: 'agent',
         hostname: os.hostname(),
@@ -385,21 +458,35 @@ class Agent {
 
     this.ws.on('close', (code) => {
       log(`disconnected from signaling server (code=${code})`);
-      this._scheduleReconnect();
+      for (const [, peer] of this.peers) {
+        if (!peer.relayOnly) {
+          peer.markDead();
+        }
+      }
+      this._scheduleSignalReconnect();
     });
 
     this.ws.on('error', (err) => {
       log(`signaling connection error: ${err.message}`);
-      this._scheduleReconnect();
+      this._scheduleSignalReconnect();
     });
   }
 
-  _scheduleReconnect() {
+  _scheduleSignalReconnect() {
     if (this.reconnectTimer) return;
+    this.wsReconnectAttempts++;
+    const delay = Math.min(
+      RECONNECT_BASE_DELAY * Math.pow(2, this.wsReconnectAttempts - 1),
+      RECONNECT_MAX_DELAY
+    );
+    log(`reconnecting signaling in ${delay}ms (attempt ${this.wsReconnectAttempts})`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this._connectSignal();
-    }, 3000);
+    }, delay);
+  }
+
+  onPeerStateChange(nodeId) {
   }
 
   _handleSignalMessage(msg) {
@@ -432,7 +519,17 @@ class Agent {
 
   _connectToPeer(peerId) {
     if (peerId === NODE_ID) return;
-    if (this.peers.has(peerId)) return;
+    if (this.peers.has(peerId)) {
+      const existing = this.peers.get(peerId);
+      if (existing.dead) {
+        if (existing.reconnectTimer) {
+          clearTimeout(existing.reconnectTimer);
+          existing.reconnectTimer = null;
+        }
+        existing.initiate();
+      }
+      return;
+    }
 
     const peer = new PeerConnection(peerId, this);
     this.peers.set(peerId, peer);
@@ -498,6 +595,11 @@ class Agent {
   handleMeshMessage(fromId, msg) {
     if (!msg || !msg.type) return;
 
+    const peer = this.peers.get(fromId);
+    if (peer && !peer.dead) {
+      peer.lastPongAt = Date.now();
+    }
+
     switch (msg.type) {
       case MSG_TYPE.QUERY:
         this._handleQuery(fromId, msg);
@@ -509,11 +611,29 @@ class Agent {
       case MSG_TYPE.LOG_STREAM_END:
         this._forwardLogMessage(fromId, msg);
         break;
-      case MSG_TYPE.PING:
-        this._sendToPeer(fromId, makePong(msg.ts));
+      case MSG_TYPE.PING: {
+        if (peer) {
+          peer.lastPongAt = Date.now();
+        }
+        this._sendToPeer(fromId, makePong(msg.ts, msg.t1));
         break;
-      case MSG_TYPE.PONG:
+      }
+      case MSG_TYPE.PONG: {
+        if (peer) {
+          const now = Date.now();
+          const t1 = msg.t1 || peer.lastPingAt;
+          const t2 = msg.t2 || msg.ts;
+          const t3 = now;
+          const rtt = t3 - t1;
+          const offset = t2 - (t1 + t3) / 2;
+          peer.rtt = rtt;
+          peer.clockOffset = offset;
+          peer.lastPongAt = now;
+          peer.dead = false;
+          peer.connected = true;
+        }
         break;
+      }
     }
   }
 
@@ -537,7 +657,7 @@ class Agent {
     if (msg.ttl > 0) {
       const forwardMsg = makeQuery(msg.queryId, msg.sourceId, msg.filters, msg.ttl - 1);
       for (const [peerId, peer] of this.peers) {
-        if (peerId !== fromId && peer.connected) {
+        if (peerId !== fromId && peer.connected && !peer.dead) {
           peer.send(forwardMsg);
         }
       }
@@ -547,7 +667,7 @@ class Agent {
   _handleQueryCancel(msg) {
     this.activeQueries.delete(msg.queryId);
     for (const [peerId, peer] of this.peers) {
-      if (peerId !== msg.sourceId && peer.connected) {
+      if (peerId !== msg.sourceId && peer.connected && !peer.dead) {
         peer.send(msg);
       }
     }
@@ -561,7 +681,7 @@ class Agent {
 
   _sendToPeer(peerId, msg) {
     const peer = this.peers.get(peerId);
-    if (peer && peer.connected) {
+    if (peer && peer.connected && !peer.dead) {
       peer.send(msg);
     } else {
       this.sendRelay(peerId, msg);

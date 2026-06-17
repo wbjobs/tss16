@@ -311,6 +311,16 @@ html, body {
   background: var(--warning);
 }
 
+.node-dot.dead {
+  background: var(--danger);
+  animation: pulse-dead 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-dead {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
 .node-info {
   flex: 1;
   min-width: 0;
@@ -323,6 +333,11 @@ html, body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.node-name-dead {
+  color: var(--text-muted);
+  text-decoration: line-through;
 }
 
 .node-meta {
